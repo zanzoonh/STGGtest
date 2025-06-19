@@ -1,11 +1,18 @@
 import os
 import sys
 import argparse
-from numpy.lib.arraysetops import unique
+#from numpy.lib.arraysetops import unique
+print("Importing numpy...")
+from numpy import unique
+print("Importing rdkit...")
 from rdkit import Chem
+print("Importing random...")
 import random
+print("Importing torch...")
 import torch
+print("Importing copy2...")
 import copy
+print("test...")
 from torch.utils.data import DataLoader
 import shutil
 
@@ -27,6 +34,10 @@ from evaluate.MCD.evaluator import TaskModel, compute_molecular_metrics
 from moses.metrics.metrics import compute_intermediate_statistics
 from joblib import dump, load
 import numpy as np
+
+from model.generator import prot
+import argparse
+print("5alas...")
 
 class CondGeneratorLightningModule(pl.LightningModule):
     def __init__(self, hparams):
@@ -769,6 +780,11 @@ class CondGeneratorLightningModule(pl.LightningModule):
         #
         parser.add_argument("--dataset_name", type=str, default="zinc") # zinc, qm9, moses, chromophore, hiv, bbbp, bace
 
+
+        # adding to the proteins 
+        parser.add_argument("--use_protein", action="store_true", help="Enable conditioning on protein sequence")
+        parser.add_argument("--protein_seq", type=str, default=None, help="Protein sequence to condition on")
+
         # Options for fine-tuning
         parser.add_argument("--finetune_dataset_name", type=str, default="") # when not empty, the dataset is used for fine-tuning
         parser.add_argument("--finetune_scaler_vocab", action="store_true") # If True, uses the fine-tuning dataset vocab instead of the pre-training dataset vocab for z-score standardization
@@ -862,10 +878,19 @@ if __name__ == "__main__":
     parser.add_argument("--log_every_n_steps", type=int, default=50)
     parser.add_argument("--gradient_clip_val", type=float, default=1.0)
     parser.add_argument("--load_checkpoint_path", type=str, default="")
-    parser.add_argument("--save_checkpoint_dir", type=str, default="/network/scratch/j/jolicoea/AutoregressiveMolecules_checkpoints")
+    parser.add_argument("--save_checkpoint_dir", type=str, default="/data/stgg/src")
     parser.add_argument("--tag", type=str, default="default")
     parser.add_argument("--test", action="store_true")
     hparams = parser.parse_args()
+
+    if hparams.use_protein:
+        model = prot(protein_seq=hparams.protein_seq, use_protein=True)
+    else:
+        model = prot(protein_seq=None, use_protein=False)
+    print(model)
+    print(hparams.protein_seq)
+    print("SUCESSSSSSSSSSSSSSSS")
+
 
     ## Add any specifics to your dataset here in terms of what to test, max_len expected, and properties (which are binary, which are continuous)
     # Note that currently, we only allow binary or continuous properties (not categorical properties with n_cat > 2)

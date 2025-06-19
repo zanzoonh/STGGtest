@@ -13,6 +13,30 @@ from time import time
 from model.transformers_sota import TransformerConfig, Transformer
 from util import property_loss
 
+import sys
+import os
+
+sys.path.append(os.path.join(os.path.dirname(__file__)))
+
+from embed_esm2 import get_esm2_embeddings
+
+class prot(nn.Module):
+    def __init__(self, protein_seq=None, use_protein=False):
+        super(prot, self).__init__()
+        self.use_protein = use_protein
+        self.protein_seq = [protein_seq]
+        if self.use_protein and self.protein_seq is not None:
+            print("Conditioning on protein sequence:", self.protein_seq)
+            self.embeddings = get_esm2_embeddings(self.protein_seq)
+            # print(type(self.embeddings))        # should be list
+            # print(len(self.embeddings))         # should be 1
+            # print(self.embeddings[0].shape)     # should be (22, 1280) or similar
+
+            print("embedding:")
+            print(self.embeddings)
+        else:
+            self.embeddings = None
+
 bce_loss = torch.nn.BCEWithLogitsLoss(reduction='mean')
 ce_loss = torch.nn.CrossEntropyLoss(reduction='mean')
 
@@ -500,4 +524,3 @@ class CondGenerator(BaseGenerator):
                         data_list[i] = data_list_[i]
 
         return data_list, loss_prop
-

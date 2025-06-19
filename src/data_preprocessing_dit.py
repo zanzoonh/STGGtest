@@ -38,7 +38,7 @@ if __name__ == "__main__":
     print('Calculating intermediate statistics for Frechet distance on test set')
     stats_path = f"../resource/data/{params.dataset_name}/fcd_stats.npy"
     torch.backends.cudnn.enabled = False
-    stat_ref = compute_intermediate_statistics(test_dataset.smiles_list, n_jobs=params.num_workers, device='cuda', batch_size=512)
+    stat_ref = compute_intermediate_statistics(test_dataset.smiles_list, n_jobs=params.num_workers, device='cpu', batch_size=512)
     dump(stat_ref, stats_path)
 
     for split, dataset in zip(['train', 'valid', 'test'], datasets):

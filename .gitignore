@@ -1,0 +1,26 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.so
+.ipynb_checkpoints/
+
+# Datasets and outputs
+*.npy
+*.npz
+*.csv.gz
+*.json
+*.pt
+*.pkl
+*.ckpt
+*.log
+
+# Experiment runs
+exp_*/
+src/test_run_check/
+src/exp_bace20epoch/
+
+# Moses and other large repos
+moses_fixed/
+
+# Neptune cache
+*.neptune/
