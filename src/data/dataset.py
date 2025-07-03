@@ -14,6 +14,8 @@ from props.properties import penalized_logp, MolLogP_smiles, qed_smiles, ExactMo
 from sklearn.preprocessing import MinMaxScaler, StandardScaler, QuantileTransformer
 from sklearn.model_selection import train_test_split
 from sklearn.base import BaseEstimator, TransformerMixin
+from protein_encoders import * 
+
 DATA_DIR = "../resource/data"
 
 class DummyDataset(Dataset): 
@@ -122,6 +124,78 @@ def fixed_data_split(n, data_dir, data):
             json.dump(val_index, f)
     print('dataset len', n, 'train len', len(train_index), 'val len', len(val_index), 'test len', len(test_index))
     return train_index, val_index, test_index
+
+class ProteinCondDataset(Dataset):
+    def __init__(self, dataset_name, raw_dir, MAX_LEN, split='train', randomize_order=False, 
+                 scaling_type='std', gflownet = False, n_properties = 1, vocab=None, start_min=True, use_protein = True, 
+                 property_column=['Kd (nM)'], protein_encoder=None,
+                 ):
+        self.dataset_name = dataset_name
+        self.data = pd.read_csv(os.path.join(raw_dir, f"data.tsv"), sep='\t')
+        self.split = split
+        self.MAX_LEN = MAX_LEN
+        self.property_column = property_column
+        self.vocab = vocab
+        self.randomize_order = randomize_order
+        self.start_min = start_min
+
+        # Filter if 'split' column exists
+        if 'split' in self.data.columns:
+            self.data = self.data[self.data['split'] == split]
+
+        self.protein_sequences = self.data['BindingDB Target Chain Sequence'].tolist()
+        self.ligand_smiles = self.data['Ligand SMILES'].tolist()
+
+        # Scale properties
+        self.properties = self.data[property_column].values
+
+        if scaling_type == 'std':
+            self.scaler = StandardScaler()
+            self.properties = self.scaler.fit_transform(self.properties)
+        else:
+            self.scaler = None
+
+        print("here8")
+        # Simple protein tokenizer
+        self.amino_acids = 'ACDEFGHIKLMNPQRSTVWY'
+        self.aa_to_idx = {aa: i + 1 for i, aa in enumerate(self.amino_acids)}  # 0 for padding
+
+
+        if protein_encoder is None:
+            raise ValueError("You must provide a protein_encoder.")
+        self.protein_encoder = protein_encoder
+
+    def __len__(self):
+        return len(self.protein_sequences)
+
+    def update_vocab(self, vocab):
+        self.vocab = vocab
+
+    def tokenize_protein(self, seq):
+        indices = [self.aa_to_idx.get(aa, 0) for aa in seq[:self.max_seq_len]]
+        indices += [0] * (self.max_seq_len - len(indices))
+        return torch.tensor(indices, dtype=torch.long)
+
+    def __getitem__(self, idx):
+        protein_seq = self.protein_sequences[idx]
+        ligand = self.ligand_smiles[idx]
+        prop = self.properties[idx]
+
+        protein_tokens = self.protein_encoder(protein_seq)
+
+        ligand_tensor = TargetData.from_smiles(
+            ligand,
+            self.vocab,
+            randomize_order=self.randomize_order,
+            MAX_LEN=self.MAX_LEN,
+            start_min=self.start_min
+        ).featurize()
+
+        return {
+            'protein': protein_tokens,
+            'ligand': ligand_tensor,
+            'property': torch.tensor(prop, dtype=torch.float)
+        }
 
 class PropCondDataset(Dataset): # molwt, LogP, QED
     def __init__(self, dataset_name, raw_dir, split, randomize_order, MAX_LEN, scaling_type = 'std', n_properties = 3, 
@@ -343,9 +417,119 @@ class PropCondDataset(Dataset): # molwt, LogP, QED
         return len(self.smiles_list)
 
     def __getitem__(self, idx):
+        print(f"[DEBUG] Loading idx {idx}")
         smiles = self.smiles_list[idx]
+        print(f"[DEBUG] SMILES: {smiles}")
         properties = self.properties[idx]
         return TargetData.from_smiles(smiles, self.vocab, randomize_order=self.randomize_order, MAX_LEN=self.MAX_LEN, start_min=self.start_min).featurize(), torch.from_numpy(properties).to(dtype=torch.float32)
+
+def get_prot_datasets(
+    dataset_name,
+    raw_dir,
+    randomize_order,
+    MAX_LEN,
+    scaling_type='std',
+    n_properties=1,
+    gflownet=False,
+    start_min=True,
+    force_vocab_redo=False,
+    sort=True,
+    protein_column="BindingDB Target Chain Sequence",
+    encode = None
+):
+    
+    vocab_train_path = os.path.join(raw_dir, f"vocab_trainval.npy")
+    vocab_test_path = os.path.join(raw_dir, f"vocab_trainvaltest.npy")
+    
+    if force_vocab_redo:
+        vocab_train, vocab_test = None, None
+        print("Building vocabulary from scratch")
+    else:
+        try:
+            vocab_train = load(vocab_train_path)
+            vocab_test = load(vocab_test_path)
+            print("Loaded the vocabulary")
+        except:
+            vocab_train, vocab_test = None, None
+            print("Could not load vocabulary; building from scratch")
+    
+    
+    data_path = os.path.join(raw_dir, f"data.tsv")  # or .tsv with sep="\t"
+    
+    df = pd.read_csv(data_path, sep="\t", on_bad_lines='warn')
+
+    df = df.head(100)
+    # df = pd.read_csv(data_path, sep=",")
+    df = df.values
+    
+    print("here5")
+    # Use your custom ProteinCondDataset
+    train_dataset = ProteinCondDataset(
+        dataset_name=dataset_name,
+        raw_dir=raw_dir,
+        MAX_LEN = MAX_LEN,
+        split="train",
+        randomize_order=randomize_order,
+        scaling_type=scaling_type,
+        gflownet=gflownet,
+        n_properties=n_properties,
+        vocab=vocab_train,
+        start_min=start_min,
+        use_protein=True,
+        protein_encoder= encode,
+    )
+
+    val_dataset = ProteinCondDataset(
+        dataset_name=dataset_name,
+        raw_dir=raw_dir,
+        MAX_LEN = MAX_LEN,
+        split="valid",
+        randomize_order=randomize_order,
+        scaling_type=scaling_type,
+        gflownet=gflownet,
+        n_properties=n_properties,
+        vocab=vocab_train,
+        start_min=start_min,
+        use_protein=True,
+        protein_encoder= encode,
+    )
+
+    test_dataset = ProteinCondDataset(
+        dataset_name=dataset_name,
+        raw_dir=raw_dir,
+        MAX_LEN = MAX_LEN,
+        split="test",
+        randomize_order=randomize_order,
+        scaling_type=scaling_type,
+        gflownet=gflownet,
+        n_properties=n_properties,
+        vocab=vocab_train,
+        start_min=start_min,
+        use_protein=True,
+        protein_encoder= encode,
+    )
+    print("here6")
+    if vocab_train is None:
+        all_smiles_list = train_dataset.ligand_smiles + val_dataset.ligand_smiles + test_dataset.ligand_smiles
+        TOKEN2ATOMFEAT, VALENCES = smiles_list2atoms_list(all_smiles_list, TOKEN2ATOMFEAT={}, VALENCES={})
+        VALENCES = get_max_valence_from_dataset(train_dataset.ligand_smiles + val_dataset.ligand_smiles, VALENCES)
+        vocab_train = SpanningTreeVocabulary(TOKEN2ATOMFEAT, VALENCES, sort=sort)
+        dump(vocab_train, vocab_train_path)
+        train_dataset.update_vocab(vocab_train)
+        val_dataset.update_vocab(vocab_train)
+
+        VALENCES_test = get_max_valence_from_dataset(all_smiles_list, VALENCES=copy.deepcopy(VALENCES))
+        vocab_test = SpanningTreeVocabulary(TOKEN2ATOMFEAT, VALENCES_test, sort=sort)
+        dump(vocab_test, vocab_test_path)
+        test_dataset.update_vocab(vocab_test)
+
+    print("here7")
+    print(f"Atom vocabulary size: {len(train_dataset.vocab.ATOM_TOKENS)}")
+    print(train_dataset.vocab.ATOM_TOKENS)
+    print("Valences from train + val:", train_dataset.vocab.VALENCES)
+    print("Valences from all data:", test_dataset.vocab.VALENCES)
+
+    return train_dataset, val_dataset, test_dataset
 
 def get_cond_datasets(dataset_name, raw_dir, randomize_order, MAX_LEN, scaling_type = 'std', n_properties = 3, 
     gflownet=False, start_min=True, force_vocab_redo=False, sort=True):

@@ -158,11 +158,30 @@ def compute_other_flat_properties(mol):
     return logp, sa, molwt
 
 @torch.no_grad()
+# def compute_flat_properties_nogap(smiles, device, num_workers=24):
+#     mols = [Chem.MolFromSmiles(smile) for smile in smiles]
+#     flat_properties = torch.as_tensor(
+#         [compute_other_flat_properties(mol) for mol in mols]).float().to(device)
+#     return flat_properties.cpu().detach().numpy()
+
 def compute_flat_properties_nogap(smiles, device, num_workers=24):
-    mols = [Chem.MolFromSmiles(smile) for smile in smiles]
-    flat_properties = torch.as_tensor(
-        [compute_other_flat_properties(mol) for mol in mols]).float().to(device)
-    return flat_properties.cpu().detach().numpy()
+    flat_properties = []
+    for i, smile in enumerate(smiles[:20]):
+        mol = Chem.MolFromSmiles(smile)
+        if mol is None:
+            print(f"[WARNING] Invalid SMILES at index {i}: {smile}")
+            flat_properties.append([0.0])  # Or handle as needed
+            continue
+        try:
+            props = compute_other_flat_properties(mol)
+            print(f"[INFO] SMILES: {smile} -> Properties: {props}")
+            flat_properties.append(props)
+        except Exception as e:
+            print(f"[ERROR] Failed to compute properties for: {smile}")
+            print(e)
+            flat_properties.append([0.0])  # Or handle gracefully
+    return torch.as_tensor(flat_properties).float().to(device).cpu().detach().numpy()
+
 
 # Taken from https://github.com/recursionpharma/gflownet/blob/f106cdeb6892214cbb528a3e06f4c721f4003175/src/gflownet/utils/metrics.py#L584
 def top_k_diversity(mols, rewards, K=10):
