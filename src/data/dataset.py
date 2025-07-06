@@ -127,8 +127,8 @@ def fixed_data_split(n, data_dir, data):
 
 class ProteinCondDataset(Dataset):
     def __init__(self, dataset_name, raw_dir, MAX_LEN, split='train', randomize_order=False, 
-                 scaling_type='std', gflownet = False, n_properties = 1, vocab=None, start_min=True, use_protein = True, 
-                 property_column=['Kd (nM)'], protein_encoder=None,
+                 scaling_type='std', gflownet = False, n_properties = 4, vocab=None, start_min=True, use_protein = True, 
+                 property_column=['Kd (nM)'], protein_encoder= SimpleProteinTokenizer,
                  ):
         self.dataset_name = dataset_name
         self.data = pd.read_csv(os.path.join(raw_dir, f"data.tsv"), sep='\t')
@@ -155,7 +155,6 @@ class ProteinCondDataset(Dataset):
         else:
             self.scaler = None
 
-        print("here8")
         # Simple protein tokenizer
         self.amino_acids = 'ACDEFGHIKLMNPQRSTVWY'
         self.aa_to_idx = {aa: i + 1 for i, aa in enumerate(self.amino_acids)}  # 0 for padding
@@ -435,7 +434,7 @@ def get_prot_datasets(
     force_vocab_redo=False,
     sort=True,
     protein_column="BindingDB Target Chain Sequence",
-    encode = None
+    encode = SimpleProteinTokenizer
 ):
     
     vocab_train_path = os.path.join(raw_dir, f"vocab_trainval.npy")
