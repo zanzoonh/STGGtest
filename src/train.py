@@ -3,13 +3,20 @@ import sys
 import argparse
 from numpy import unique
 from rdkit import Chem
+print("Importing random...")
 import random
+print("Importing torch...")
 import torch
+print("Importing copy2...")
 import copy
+print("test...")
 from torch.utils.data import DataLoader
 import shutil
 
 import torch.distributed as dist
+#added
+import torch.nn as nn
+
 import lightning as pl
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import NeptuneLogger
@@ -27,6 +34,12 @@ from evaluate.MCD.evaluator import TaskModel, compute_molecular_metrics
 from moses.metrics.metrics import compute_intermediate_statistics
 from joblib import dump, load
 import numpy as np
+
+from model.generator import prot
+import argparse
+print("5alas...")
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class CondGeneratorLightningModule(pl.LightningModule):
     def __init__(self, hparams):
@@ -92,6 +105,37 @@ class CondGeneratorLightningModule(pl.LightningModule):
         self.collate_fn = collate_fn
 
     def setup_model(self):
+        # Added: passing protein embedding to CondGenerator in generator 
+        # if self.hparams.use_protein:
+            #protein_model = prot(protein_seq=self.hparams.protein_seq, use_protein=True)
+    
+            #with torch.no_grad():
+            # protein_context = torch.randn(1, 153, self.hparams.emb_size).to(self.device)
+                #protein_context = protein_model.embeddings[0].unsqueeze(0).to(self.device)  # [1, seq_len, 1024]
+    
+                #self.protein_proj = nn.Linear(1280, self.hparams.emb_size).to(self.device)  # match your embedding dim
+                #protein_context = self.protein_proj(protein_context).detach()  # final shape: [1, seq_len, emb_size]
+    
+        #     print("embedding:")
+        #     print(protein_context)
+        #     print(self.hparams.protein_seq)
+        #     print("SUCESSSSSSSSSSSSSSSS")
+    
+        # else:
+        #     protein_context = None
+        if self.hparams.use_protein:
+            # Use prot wrapper class to get the ESM2 embedding
+            protein_model = prot(protein_seq=self.hparams.protein_seq, use_protein=True)
+            with torch.no_grad():
+                protein_embedding = protein_model.embeddings[0].unsqueeze(0).to(self.device)  # [1, seq_len, 1280]
+        
+            print("Got protein embedding from prot:", protein_embedding.shape)
+        
+            # Remove projection from here – move to model
+            protein_context = protein_embedding  # pass unprojected into the model
+        else:
+            protein_context = None
+
         self.model = CondGenerator(
             num_layers=self.hparams.num_layers,
             emb_size=self.hparams.emb_size,
@@ -120,7 +164,14 @@ class CondGeneratorLightningModule(pl.LightningModule):
             cond_lin=self.hparams.cond_lin,
             cat_var_index=self.hparams.cat_var_index,
             cont_var_index=self.hparams.cont_var_index,
+            #added
+            use_protein=self.hparams.use_protein,
+            protein_context=protein_context
+
         )
+        self.model.use_protein = self.hparams.use_protein
+        self.model.protein_context = protein_context
+    
 
     ### Dataloaders and optimizers
     def train_dataloader(self):
@@ -775,6 +826,11 @@ class CondGeneratorLightningModule(pl.LightningModule):
         #
         parser.add_argument("--dataset_name", type=str, default="zinc") # zinc, qm9, moses, chromophore, hiv, bbbp, bace
 
+
+        # adding to the proteins 
+        parser.add_argument("--use_protein", action="store_true", help="Enable conditioning on protein sequence")
+        parser.add_argument("--protein_seq", type=str, default=None, help="Protein sequence to condition on")
+
         # Options for fine-tuning
         parser.add_argument("--finetune_dataset_name", type=str, default="") # when not empty, the dataset is used for fine-tuning
         parser.add_argument("--finetune_scaler_vocab", action="store_true") # If True, uses the fine-tuning dataset vocab instead of the pre-training dataset vocab for z-score standardization
@@ -868,10 +924,19 @@ if __name__ == "__main__":
     parser.add_argument("--log_every_n_steps", type=int, default=50)
     parser.add_argument("--gradient_clip_val", type=float, default=1.0)
     parser.add_argument("--load_checkpoint_path", type=str, default="")
-    parser.add_argument("--save_checkpoint_dir", type=str, default="./checkpoints/")
+    parser.add_argument("--save_checkpoint_dir", type=str, default="/data/stggnew/src")
     parser.add_argument("--tag", type=str, default="default")
     parser.add_argument("--test", action="store_true")
     hparams = parser.parse_args()
+
+    # if hparams.use_protein:
+    #     model = prot(protein_seq=hparams.protein_seq, use_protein=True)
+    # else:
+    #     model = prot(protein_seq=None, use_protein=False)
+    # print(model)
+    # print(hparams.protein_seq)
+    # print("SUCESSSSSSSSSSSSSSSS")
+
 
     ## Add any specifics to your dataset here in terms of what to test, max_len expected, and properties (which are binary, which are continuous)
     # Note that currently, we only allow binary or continuous properties (not categorical properties with n_cat > 2)
