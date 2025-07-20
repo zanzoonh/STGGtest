@@ -154,6 +154,8 @@ class Block(nn.Module):
     def __init__(self, config, rotary_emb):
         super().__init__()
 
+        #added, cross attention initialization 
+        self.cross_attn = nn.MultiheadAttention(config.n_embd, config.n_head, dropout=config.dropout, batch_first=True)
         if config.rmsnorm:
             self.ln_1 = RMSNorm(config.n_embd, weight=True)
         else:
@@ -169,8 +171,16 @@ class Block(nn.Module):
         self.mlp = MLP(config)
         self.config = config
 
-    def forward(self, x, mask, emb):
+    def forward(self, x, mask, emb, protein_context):
         x = x + self.attn(self.ln_1(x), mask)
+        #added, adding cross-attention if context is provided
+        if protein_context is not None:
+            x_ln = self.ln_1(x)  # Optional: new layer norm for cross, transformer's hidden representation of the molecule generated up to this point
+            # print("x_ln shape", x_ln.shape)
+            # print("protein_context shape", protein_context.shape)
+            #cross attention is a tuple of (attn output, attn weights)
+            x = x + self.cross_attn(query=x_ln, key=protein_context, value=protein_context)[0]
+
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -209,11 +219,11 @@ class Transformer(nn.Module):
             ln_f = RMSNorm(config.n_embd, weight=True) if config.rmsnorm else LayerNorm(config.n_embd, bias=config.bias),
         ))
 
-    def forward(self, x, mask=None, emb_cond=None):
+    def forward(self, x, mask=None, emb_cond=None, protein_context=None):
 
         # forward the GPT model itself
         for block in self.transformer.h:
-            x = block(x, mask, emb_cond)
+            x = block(x, mask, emb_cond, protein_context = protein_context)
         x = self.transformer.ln_f(x)
 
         return x

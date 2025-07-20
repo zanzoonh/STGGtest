@@ -13,6 +13,30 @@ from time import time
 from model.transformers_sota import TransformerConfig, Transformer
 from util import property_loss
 
+import sys
+import os
+
+sys.path.append(os.path.join(os.path.dirname(__file__)))
+
+from embed_esm2 import get_esm2_embeddings
+
+class prot(nn.Module):
+    def __init__(self, protein_seq=None, use_protein=False):
+        super(prot, self).__init__()
+        self.use_protein = use_protein
+        self.protein_seq = [protein_seq]
+        if self.use_protein and self.protein_seq is not None:
+            print("Conditioning on protein sequence:", self.protein_seq)
+            self.embeddings = get_esm2_embeddings(self.protein_seq)
+            # print(type(self.embeddings))        # should be list
+            # print(len(self.embeddings))         # should be 1
+            # print(self.embeddings[0].shape)     # should be (22, 1280) or similar
+
+            # print("embedding:")
+            # print(self.embeddings)
+        else:
+            self.embeddings = None
+
 bce_loss = torch.nn.BCEWithLogitsLoss(reduction='mean')
 ce_loss = torch.nn.CrossEntropyLoss(reduction='mean')
 
@@ -225,6 +249,9 @@ class CondGenerator(BaseGenerator):
         cond_lin,
         cat_var_index,
         cont_var_index,
+        #added
+        use_protein=False,
+        protein_context=None
         ):
         super(CondGenerator, self).__init__(
             num_layers=num_layers,
@@ -253,6 +280,12 @@ class CondGenerator(BaseGenerator):
             cat_var_index=cat_var_index,
             cont_var_index=cont_var_index,
         )
+        #added, initalizing the embedding of proteins 
+        self.use_protein = use_protein
+        if self.use_protein:
+            self.protein_proj = nn.Linear(1280, emb_size)
+
+        self.protein_context = protein_context
         self.lambda_predict_prop = lambda_predict_prop
         self.disable_random_prop_mask = disable_random_prop_mask
         self.n_properties = n_properties
@@ -305,7 +338,7 @@ class CondGenerator(BaseGenerator):
 
         return emb
 
-    def forward(self, batched_mol_data, batched_cond_data, mask_cond=None):
+    def forward(self, batched_mol_data, batched_cond_data, batched_prot_data = None, mask_cond=None):
         (
             sequences,
             count_sequences,
@@ -329,6 +362,29 @@ class CondGenerator(BaseGenerator):
         out += self.apply_cond_layer(batched_cond_data, mask_cond)
         out = self.input_dropout(out)
 
+        #added, prepare protein context to replicate number of batch size amount of times
+        if self.use_protein and self.protein_context is not None:
+            protein_context = batched_prot_data
+            # print("Using protein context in generation.")
+            # print("Protein context shape:", self.protein_context.shape)
+            # print(self.protein_context[0][0][:5])
+            protein_context = pad_sequence(batched_prot_data, batch_first=True).to(out.device)
+            # protein_context = self.protein_context.repeat(batch_size, 1, 1)  # replicate for batch
+            # protein_context = protein_context.to(out.device)  # 🔥 Now it's on same device as x
+        else:
+            protein_context = None
+        # if self.use_protein and batched_prot_data is not None:
+        #     #print('batched', batched_prot_data)
+        #     protein_context = batched_prot_data
+        #     # print("Using protein context in generation.")
+        #     # print("Original shape:", self.protein_context.shape)
+        #     # #self.protein_proj = self.protein_proj.to(self.protein_context.device)  # <-- Add this line
+        #     # #projected_context = self.protein_proj(self.protein_context)  # [1, seq_len, emb_size]
+        #     # projected_context = self.protein_proj(self.protein_context.to(self.protein_proj.weight.device))
+        #     # protein_context = projected_context.repeat(batch_size, 1, 1).to(out.device)
+        # else:
+        #     protein_context = None
+
         #
         mask = torch.zeros(batch_size, sequence_len, sequence_len, self.nhead, device=out.device)
         if not (self.enable_absloc or self.rotary):
@@ -345,14 +401,15 @@ class CondGenerator(BaseGenerator):
         bool_mask = bool_mask.view(1, 1, sequence_len, sequence_len).repeat(batch_size, self.nhead, 1, 1)
         mask = mask.masked_fill(bool_mask == 0, float("-inf"))
 
-        #
+        #added, calling transformer with protein context
         if self.gpt:
-            out = self.transformer(out, mask, emb_cond)
+            out = self.transformer(out, mask, emb_cond, protein_context=protein_context)
         else:
             mask = mask.reshape(-1, sequence_len, sequence_len)
             key_padding_mask = sequences == self.vocab.get_id(PAD_TOKEN)
             out = out.transpose(0, 1)
-            out = self.transformer(out, mask, key_padding_mask)
+            #added, calling transformer with protein context
+            out = self.transformer(out, mask, key_padding_mask, protein_context=protein_context)
             out = out.transpose(0, 1)
         #
         logits0 = self.generator(out)
@@ -500,4 +557,3 @@ class CondGenerator(BaseGenerator):
                         data_list[i] = data_list_[i]
 
         return data_list, loss_prop
-

@@ -1,7 +1,7 @@
 import os
 import sys
 import argparse
-from numpy.lib.arraysetops import unique
+from numpy import unique
 from rdkit import Chem
 import random
 import torch
@@ -10,6 +10,9 @@ from torch.utils.data import DataLoader
 import shutil
 
 import torch.distributed as dist
+#added
+import torch.nn as nn
+
 import lightning as pl
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import NeptuneLogger
@@ -20,13 +23,19 @@ from data.target_data import Data as TargetData
 from torch.distributions.bernoulli import Bernoulli
 
 from model.generator import CondGenerator
-from data.dataset import get_cond_datasets, DummyDataset, merge_datasets
+from data.dataset import get_cond_datasets, DummyDataset, merge_datasets, get_prot_datasets
 from props.properties import penalized_logp, MAE_properties, best_rewards_gflownet
 from util import compute_sequence_cross_entropy, compute_property_accuracy, compute_sequence_accuracy, canonicalize
 from evaluate.MCD.evaluator import TaskModel, compute_molecular_metrics
 from moses.metrics.metrics import compute_intermediate_statistics
 from joblib import dump, load
 import numpy as np
+
+from model.generator import prot
+import argparse
+from protein_encoders import * 
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class CondGeneratorLightningModule(pl.LightningModule):
     def __init__(self, hparams):
@@ -38,11 +47,18 @@ class CondGeneratorLightningModule(pl.LightningModule):
 
     def setup_datasets(self):
         raw_dir = f"../resource/data/{self.hparams.dataset_name}"
-        self.train_dataset, self.val_dataset, self.test_dataset = get_cond_datasets(dataset_name=self.hparams.dataset_name,
+        if self.hparams.use_protein:
+            self.train_dataset, self.val_dataset, self.test_dataset = get_prot_datasets(dataset_name=self.hparams.dataset_name,
             raw_dir=raw_dir, randomize_order=self.hparams.randomize_order, 
             MAX_LEN=self.hparams.max_len, scaling_type=self.hparams.scaling_type, 
             gflownet=self.hparams.gflownet, 
             n_properties=self.hparams.n_properties, start_min=not self.hparams.start_random)
+        else:
+            self.train_dataset, self.val_dataset, self.test_dataset = get_cond_datasets(dataset_name=self.hparams.dataset_name,
+                raw_dir=raw_dir, randomize_order=self.hparams.randomize_order, 
+                MAX_LEN=self.hparams.max_len, scaling_type=self.hparams.scaling_type, 
+                gflownet=self.hparams.gflownet, 
+                n_properties=self.hparams.n_properties, start_min=not self.hparams.start_random)
         print(self.train_dataset.scaler_std_properties.column_transformer.mean_)
         print(self.train_dataset.scaler_std_properties.column_transformer.var_)
 
@@ -86,12 +102,42 @@ class CondGeneratorLightningModule(pl.LightningModule):
         self.hparams.vocab = self.train_dataset.vocab
 
         def collate_fn(data_list):
-            batched_mol_data, batched_cond_data = zip(*data_list)
-            return TargetData.collate(batched_mol_data), torch.stack(batched_cond_data, dim=0)    
+            #print('enetered collate')
+            #print(data_list[0])
+            #print(len(data_list[0]))
+            if not self.hparams.use_protein:
+        # Dataset returns (mol, cond)
+                batched_mol_data, batched_cond_data = zip(*data_list)
+                return TargetData.collate(batched_mol_data), torch.stack(batched_cond_data, dim=0)
+
+            else:
+                # Dataset returns (mol, cond, protein)
+                batched_protein_data, batched_mol_data, batched_cond_data = zip(*data_list)
+                mol_batch = TargetData.collate(batched_mol_data)
+                cond_batch = torch.stack(batched_cond_data, dim=0)
+
+                padded_seqs = [seq + '-' * (self.hparams.max_len - len(seq)) for seq in batched_protein_data]
+                return mol_batch, cond_batch, padded_seqs
+        # def collate_fn(data_list):
+        #     batched_mol_data, batched_cond_data = zip(*data_list)
+        #     return TargetData.collate(batched_mol_data), torch.stack(batched_cond_data, dim=0)    
 
         self.collate_fn = collate_fn
 
     def setup_model(self):
+        if self.hparams.use_protein and not self.hparams.protein_seq is None:
+            # Use prot wrapper class to get the ESM2 embedding
+            protein_model = prot(protein_seq=self.hparams.protein_seq, use_protein=True)
+            with torch.no_grad():
+                protein_embedding = protein_model.embeddings[0].unsqueeze(0).to(self.device)  # [1, seq_len, 1280]
+        
+            print("Got protein embedding from prot:", protein_embedding.shape)
+        
+            # Remove projection from here – move to model
+            protein_context = protein_embedding  # pass unprojected into the model
+        else:
+            protein_context = None
+
         self.model = CondGenerator(
             num_layers=self.hparams.num_layers,
             emb_size=self.hparams.emb_size,
@@ -120,16 +166,25 @@ class CondGeneratorLightningModule(pl.LightningModule):
             cond_lin=self.hparams.cond_lin,
             cat_var_index=self.hparams.cat_var_index,
             cont_var_index=self.hparams.cont_var_index,
+            #added
+            use_protein=self.hparams.use_protein,
+            protein_context=protein_context
+
         )
+        self.model.use_protein = self.hparams.use_protein
+        self.model.protein_context = protein_context
+    
 
     ### Dataloaders and optimizers
     def train_dataloader(self):
+        print('train_dataloader')
         return DataLoader(
             self.train_dataset,
             batch_size=self.hparams.batch_size,
             shuffle=True,
             collate_fn=self.collate_fn,
-            num_workers=0 if self.hparams.test else self.hparams.num_workers,
+            #if self.hparams.test else self.hparams.num_workers,
+            num_workers=6, 
             drop_last=False,
             persistent_workers=not self.hparams.test and self.hparams.num_workers > 0, pin_memory=True,
         )
@@ -140,7 +195,8 @@ class CondGeneratorLightningModule(pl.LightningModule):
             batch_size=self.hparams.batch_size,
             shuffle=False,
             collate_fn=self.collate_fn,
-            num_workers=0 if self.hparams.test else self.hparams.num_workers,
+            # if self.hparams.test else self.hparams.num_workers,
+            num_workers=6, 
             drop_last=False,
             persistent_workers=not self.hparams.test and self.hparams.num_workers > 0, pin_memory=True,
         )
@@ -152,7 +208,7 @@ class CondGeneratorLightningModule(pl.LightningModule):
                 DummyDataset(),
                 batch_size=1,
                 shuffle=False,
-                num_workers=0,
+                num_workers=6,
             )
         elif self.hparams.test_on_train_data:
             dset = self.train_dataset
@@ -163,7 +219,8 @@ class CondGeneratorLightningModule(pl.LightningModule):
             batch_size=self.hparams.batch_size,
             shuffle=False,
             collate_fn=self.collate_fn,
-            num_workers=self.hparams.num_workers if self.hparams.test else 0,
+            num_workers = 6,
+            #num_workers=self.hparams.num_workers if self.hparams.test else 0,
             drop_last=False,
             persistent_workers=False, pin_memory=True,
         )
@@ -198,42 +255,76 @@ class CondGeneratorLightningModule(pl.LightningModule):
 
     def shared_step(self, batched_data, whole_data_metrics=False):
         loss, statistics = 0.0, dict()
-
+        print('entered shared step')
         # decoding
-        batched_mol_data, batched_cond_data = batched_data
-        logits, pred_prop = self.model(batched_mol_data, batched_cond_data)
-        loss, loss_prop_cont, loss_prop_cat = compute_sequence_cross_entropy(logits, batched_mol_data[0], ignore_index=0, 
-            prop=batched_cond_data, pred_prop=pred_prop, lambda_predict_prop=self.hparams.lambda_predict_prop, 
-            cont_var_index=self.hparams.cont_var_index, cat_var_index=self.hparams.cat_var_index)
+        if not self.hparams.use_protein:
+            batched_mol_data, batched_cond_data = batched_data
+            logits, pred_prop = self.model(batched_mol_data, batched_cond_data)
+            loss, loss_prop_cont, loss_prop_cat = compute_sequence_cross_entropy(logits, batched_mol_data[0], ignore_index=0, 
+                prop=batched_cond_data, pred_prop=pred_prop, lambda_predict_prop=self.hparams.lambda_predict_prop, 
+                cont_var_index=self.hparams.cont_var_index, cat_var_index=self.hparams.cat_var_index)
 
-        statistics["loss/total"] = loss
-        statistics["loss/class"] = loss - loss_prop_cont - loss_prop_cat
-        statistics["loss/prop_cont"] = loss_prop_cont
-        statistics["loss/prop_cat"] = loss_prop_cat
-        statistics["acc/total"] = compute_sequence_accuracy(logits, batched_mol_data[0], ignore_index=0)[0]
+            statistics["loss/total"] = loss
+            statistics["loss/class"] = loss - loss_prop_cont - loss_prop_cat
+            statistics["loss/prop_cont"] = loss_prop_cont
+            statistics["loss/prop_cat"] = loss_prop_cat
+            statistics["acc/total"] = compute_sequence_accuracy(logits, batched_mol_data[0], ignore_index=0)[0]
 
-        if self.hparams.lambda_predict_prop > 0:
-            if whole_data_metrics: # computer over whole dataset
-                b = batched_mol_data[0].shape[0]
-                test_step_pred_acc = compute_property_accuracy(batched_mol_data[0], 
-                    prop=batched_cond_data, pred_prop=pred_prop, 
-                    cont_var_index=self.hparams.cont_var_index, cat_var_index=self.hparams.cat_var_index, mean=False)
-                self.test_step_pred_acc.append(test_step_pred_acc)
-            else: # computer over the mini-batch
-                validation_step_pred_acc = compute_property_accuracy(batched_mol_data[0], 
-                    prop=batched_cond_data, pred_prop=pred_prop, 
-                    cont_var_index=self.hparams.cont_var_index, cat_var_index=self.hparams.cat_var_index, mean=True)
-                for i, prop_acc in enumerate(validation_step_pred_acc):
-                    statistics[f"acc/prop{i}"] = prop_acc
+            if self.hparams.lambda_predict_prop > 0:
+                if whole_data_metrics: # computer over whole dataset
+                    b = batched_mol_data[0].shape[0]
+                    test_step_pred_acc = compute_property_accuracy(batched_mol_data[0], 
+                        prop=batched_cond_data, pred_prop=pred_prop, 
+                        cont_var_index=self.hparams.cont_var_index, cat_var_index=self.hparams.cat_var_index, mean=False)
+                    self.test_step_pred_acc.append(test_step_pred_acc)
+                else: # computer over the mini-batch
+                    validation_step_pred_acc = compute_property_accuracy(batched_mol_data[0], 
+                        prop=batched_cond_data, pred_prop=pred_prop, 
+                        cont_var_index=self.hparams.cont_var_index, cat_var_index=self.hparams.cat_var_index, mean=True)
+                    for i, prop_acc in enumerate(validation_step_pred_acc):
+                        statistics[f"acc/prop{i}"] = prop_acc
+        else:
+            #print('batched', batched_data)
+            batched_mol_data, batched_cond_data, batched_prot_data = batched_data
+            encoder = ESMEncoder(max_len=512)
+            protein_tokens = encoder(batched_prot_data)
+            #embed proteins
+            logits, pred_prop = self.model(batched_mol_data, batched_cond_data, protein_tokens)
+            loss, loss_prop_cont, loss_prop_cat = compute_sequence_cross_entropy(logits, batched_mol_data[0], ignore_index=0, 
+                prop=batched_cond_data, pred_prop=pred_prop, lambda_predict_prop=self.hparams.lambda_predict_prop, 
+                cont_var_index=self.hparams.cont_var_index, cat_var_index=self.hparams.cat_var_index)
+
+            statistics["loss/total"] = loss
+            statistics["loss/class"] = loss - loss_prop_cont - loss_prop_cat
+            statistics["loss/prop_cont"] = loss_prop_cont
+            statistics["loss/prop_cat"] = loss_prop_cat
+            statistics["acc/total"] = compute_sequence_accuracy(logits, batched_mol_data[0], ignore_index=0)[0]
+
+            if self.hparams.lambda_predict_prop > 0:
+                if whole_data_metrics: # computer over whole dataset
+                    b = batched_mol_data[0].shape[0]
+                    test_step_pred_acc = compute_property_accuracy(batched_mol_data[0], 
+                        prop=batched_cond_data, pred_prop=pred_prop, 
+                        cont_var_index=self.hparams.cont_var_index, cat_var_index=self.hparams.cat_var_index, mean=False)
+                    self.test_step_pred_acc.append(test_step_pred_acc)
+                else: # computer over the mini-batch
+                    validation_step_pred_acc = compute_property_accuracy(batched_mol_data[0], 
+                        prop=batched_cond_data, pred_prop=pred_prop, 
+                        cont_var_index=self.hparams.cont_var_index, cat_var_index=self.hparams.cat_var_index, mean=True)
+                    for i, prop_acc in enumerate(validation_step_pred_acc):
+                        statistics[f"acc/prop{i}"] = prop_acc
+        
         return loss, statistics
 
     def training_step(self, batched_data, batch_idx):
+        print('training_step')
         loss, statistics = self.shared_step(batched_data, whole_data_metrics=False)
         for key, val in statistics.items():
             self.log(f"train/{key}", val, on_step=True, logger=True, sync_dist=self.hparams.n_gpu > 1)
         return loss
 
     def validation_step(self, batched_data, batch_idx):
+        print('validation_step')
         if self.hparams.no_test_step:
             loss = 0.0
         else:
@@ -243,6 +334,7 @@ class CondGeneratorLightningModule(pl.LightningModule):
         return loss
 
     def test_step(self, batched_data, batch_idx):
+        print('test_step')
         if self.hparams.no_test_step:
             loss = 0.0
         else:
@@ -287,6 +379,8 @@ class CondGeneratorLightningModule(pl.LightningModule):
                     self.check_samples_uncond() # uncond
                 if not self.hparams.no_ood: 
                     self.check_samples_ood() # cond on ood values
+                if self.hparams.use_protein:
+                    self.check_samples_prot()
                 else:
                     self.check_samples() # cond on train properties
 
@@ -421,10 +515,11 @@ class CondGeneratorLightningModule(pl.LightningModule):
             batch_size=self.hparams.sample_batch_size,
             shuffle=True,
             collate_fn=self.collate_fn,
-            num_workers=self.hparams.num_workers-1,
+            num_workers=6,
             drop_last=False,
             persistent_workers=False, pin_memory=True,
         )
+        #print("got here")
         train_loader_iter = iter(my_loader)
 
         offset = 0
@@ -432,10 +527,11 @@ class CondGeneratorLightningModule(pl.LightningModule):
         loss_prop = []
         properties = None
         self.model.eval()
+        #print("breathed")
         while offset < num_samples:
             cur_num_samples = min(num_samples - offset, self.hparams.sample_batch_size)
             offset += cur_num_samples
-            print(offset)
+            #print(offset)
             try:
                 _, batched_cond_data = next(train_loader_iter)
             except:
@@ -449,6 +545,7 @@ class CondGeneratorLightningModule(pl.LightningModule):
                     _, batched_cond_data_ = next(train_loader_iter)
                 batched_cond_data = torch.cat((batched_cond_data, batched_cond_data_), dim=0)
             batched_cond_data = batched_cond_data[:cur_num_samples,:].to(device=self.device)
+            print("in the middle")
             if properties is None:
                 properties = batched_cond_data
             else:
@@ -467,8 +564,67 @@ class CondGeneratorLightningModule(pl.LightningModule):
         disable_rdkit_log()
         smiles_list = [canonicalize(elem[0]) for elem in results]
         enable_rdkit_log()
-
+        print("got here")
         return smiles_list, results, properties, loss_prop
+
+    def sample_prot(self, num_samples):
+        my_loader = DataLoader(
+            self.test_dataset,
+            batch_size=self.hparams.sample_batch_size,
+            shuffle=True,
+            collate_fn=self.collate_fn,
+            num_workers=6,
+            drop_last=False,
+            persistent_workers=False, pin_memory=True,
+        )
+        print("got here")
+        train_loader_iter = iter(my_loader)
+
+        offset = 0
+        results = []
+        loss_prop = []
+        properties = None
+        self.model.eval()
+        print("breathed")
+        while offset < num_samples:
+            cur_num_samples = min(num_samples - offset, self.hparams.sample_batch_size)
+            offset += cur_num_samples
+            print(offset)
+            try:
+                _, batched_cond_data, prots = next(train_loader_iter)
+            except:
+                train_loader_iter = iter(my_loader)
+                _, batched_cond_data, prots = next(train_loader_iter)
+            while batched_cond_data.shape[0] < cur_num_samples:
+                try:
+                    _, batched_cond_data_, prots = next(train_loader_iter)
+                except:
+                    train_loader_iter = iter(my_loader)
+                    _, batched_cond_data_, prots = next(train_loader_iter)
+                batched_cond_data = torch.cat((batched_cond_data, batched_cond_data_), dim=0)
+            batched_cond_data = batched_cond_data[:cur_num_samples,:].to(device=self.device)
+            prots = prots[:cur_num_samples]
+            batched_protein = self.protein_encoder(prots)
+            print("in the middle")
+            if properties is None:
+                properties = batched_cond_data
+            else:
+                properties = torch.cat((properties, batched_cond_data), dim=0)
+            data_list, loss_prop_ = self.model.decode(batched_cond_data, protein_context = batched_protein, max_len=self.hparams.max_len, device=self.device, 
+                temperature=self.hparams.temperature, guidance=self.hparams.guidance, guidance_rand=self.hparams.guidance_rand,
+                top_k=self.hparams.top_k, best_out_of_k=self.hparams.best_out_of_k,
+                predict_prop=self.hparams.lambda_predict_prop > 0,
+                allow_empty_bond=not self.hparams.not_allow_empty_bond)
+            if loss_prop_ is not None:
+                loss_prop += [loss_prop_]
+            results.extend((data.to_smiles(), "".join(data.tokens), data.error) for data in data_list)
+        if loss_prop_ is not None:
+            loss_prop = torch.cat(loss_prop, dim=0)
+        self.model.train()
+        disable_rdkit_log()
+        smiles_list = [canonicalize(elem[0]) for elem in results]
+        enable_rdkit_log()
+        return smiles_list, results, properties, loss_prop, batched_protein
 
     def check_samples(self):
         assert self.hparams.num_samples % self.hparams.n_gpu == 0
@@ -718,6 +874,7 @@ class CondGeneratorLightningModule(pl.LightningModule):
             smiles_list = self.test_dataset.smiles_list
             properties = self.test_dataset.properties
         else:
+            # editthis 
             local_smiles_list, results, local_properties, _ = self.sample(num_samples)
             if self.hparams.n_gpu > 1:
                 # Gather results
@@ -740,6 +897,7 @@ class CondGeneratorLightningModule(pl.LightningModule):
         unique_smiles_set = set(valid_smiles_list)
         novel_smiles_list = [smiles for smiles in valid_smiles_list if smiles not in self.train_smiles_set]
         efficient_smiles_list = [smiles for smiles in unique_smiles_set if smiles in novel_smiles_list]
+        # add binding affinity 
         statistics = dict()
         statistics["sample/valid"] = float(len(valid_smiles_list)) / self.hparams.num_samples
         statistics["sample/unique"] = float(len(unique_smiles_set)) / len(valid_smiles_list)
@@ -763,11 +921,92 @@ class CondGeneratorLightningModule(pl.LightningModule):
         torch.backends.cudnn.enabled = True
         for key, val in metrics.items():
             self.log(key, val, on_step=False, on_epoch=True, logger=True, sync_dist=self.hparams.n_gpu > 1)
+        
+    def check_samples_prot(self):
+        assert self.hparams.num_samples % self.hparams.n_gpu == 0
+        num_samples = self.hparams.num_samples // self.hparams.n_gpu if not self.trainer.sanity_checking else 2
+        local_smiles_list, results, local_properties, _, prots = self.sample_prot(num_samples)
+
+        if self.hparams.n_gpu > 1:
+            # Gather results
+            global_smiles_list = [None for _ in range(self.hparams.n_gpu)]
+            dist.all_gather_object(global_smiles_list, local_smiles_list)
+            smiles_list = []
+            for i in range(self.hparams.n_gpu):
+                print(i)
+                print(len(global_smiles_list[i]))
+                smiles_list += global_smiles_list[i]
+
+            global_properties = [torch.zeros_like(local_properties) for _ in range(self.hparams.n_gpu)]
+            dist.all_gather(global_properties, local_properties)
+            properties = torch.cat(global_properties, dim=0)
+        else:
+            smiles_list = local_smiles_list
+            properties = local_properties
+
+        print('metrics')
+        #
+        idx_valid = []
+        valid_smiles_list = []
+        valid_mols_list = []
+        for smiles in smiles_list:
+            if smiles is not None:
+                mol = Chem.MolFromSmiles(smiles)
+                if mol is not None:
+                    idx_valid += [True]
+                    valid_smiles_list += [smiles]
+                    valid_mols_list += [mol]
+                else:
+                    idx_valid += [False]
+            else:
+                idx_valid += [False]
+                
+        unique_smiles_set = set(valid_smiles_list)
+        novel_smiles_list = [smiles for smiles in valid_smiles_list if smiles not in self.train_smiles_set]
+        efficient_smiles_list = [smiles for smiles in unique_smiles_set if smiles in novel_smiles_list]
+        statistics = dict()
+        #binding statistic 
+        statistics["sample/valid"] = float(len(valid_smiles_list)) / self.hparams.num_samples
+        statistics["sample/unique"] = float(len(unique_smiles_set)) / len(valid_smiles_list)
+        statistics["sample/novel"] = float(len(novel_smiles_list)) / len(valid_smiles_list)
+        statistics["sample/efficient"] = float(len(efficient_smiles_list)) / self.hparams.num_samples
+        if self.train_dataset.scaler_properties is not None:
+            properties_unscaled = torch.tensor(self.train_dataset.scaler_properties.inverse_transform(properties[idx_valid].cpu().numpy())).to(dtype=torch.float32, device=self.device)
+        else:
+            properties_unscaled = properties[idx_valid]
+        statistics["sample/Min_MAE"], statistics[f"sample/Min10_MAE"], statistics[f"sample/Min100_MAE"] = MAE_properties(valid_mols_list, properties=properties_unscaled) # molwt, LogP, QED
+        print(statistics["sample/Min_MAE"])
+        print(statistics["sample/Min10_MAE"])
+        print(statistics["sample/Min100_MAE"])
+
+        #
+        for key, val in statistics.items():
+            self.log(key, val, on_step=False, on_epoch=True, logger=True, sync_dist=self.hparams.n_gpu > 1)
+        
+        if len(valid_smiles_list) > 0:
+            torch.backends.cudnn.enabled = False
+            print('get-all-metrics')
+            moses_statistics = moses.get_all_metrics(
+                smiles_list, 
+                n_jobs=self.hparams.num_workers-1,
+                device=str(self.device), 
+                train=self.train_dataset.smiles_list, 
+                test=self.test_dataset.smiles_list,
+            )
+            print('get-all-metrics done')
+            for key in moses_statistics:
+                self.log(f"sample/moses/{key}", moses_statistics[key], on_step=False, on_epoch=True, logger=True, sync_dist=self.hparams.n_gpu > 1)#, rank_zero_only=True)
+            torch.backends.cudnn.enabled = True
 
     @staticmethod
     def add_args(parser):
         #
         parser.add_argument("--dataset_name", type=str, default="zinc") # zinc, qm9, moses, chromophore, hiv, bbbp, bace
+
+
+        # adding to the proteins 
+        parser.add_argument("--use_protein", action="store_true", help="Enable conditioning on protein sequence")
+        parser.add_argument("--protein_seq", type=str, default=None, help="Protein sequence to condition on")
 
         # Options for fine-tuning
         parser.add_argument("--finetune_dataset_name", type=str, default="") # when not empty, the dataset is used for fine-tuning
@@ -862,10 +1101,19 @@ if __name__ == "__main__":
     parser.add_argument("--log_every_n_steps", type=int, default=50)
     parser.add_argument("--gradient_clip_val", type=float, default=1.0)
     parser.add_argument("--load_checkpoint_path", type=str, default="")
-    parser.add_argument("--save_checkpoint_dir", type=str, default="/network/scratch/j/jolicoea/AutoregressiveMolecules_checkpoints")
+    parser.add_argument("--save_checkpoint_dir", type=str, default="./checkpoints/")
     parser.add_argument("--tag", type=str, default="default")
     parser.add_argument("--test", action="store_true")
     hparams = parser.parse_args()
+
+    # if hparams.use_protein:
+    #     model = prot(protein_seq=hparams.protein_seq, use_protein=True)
+    # else:
+    #     model = prot(protein_seq=None, use_protein=False)
+    # print(model)
+    # print(hparams.protein_seq)
+    # print("SUCESSSSSSSSSSSSSSSS")
+
 
     ## Add any specifics to your dataset here in terms of what to test, max_len expected, and properties (which are binary, which are continuous)
     # Note that currently, we only allow binary or continuous properties (not categorical properties with n_cat > 2)
@@ -892,6 +1140,10 @@ if __name__ == "__main__":
         if hparams.dataset_name == 'chromophore':
             assert hparams.max_len >= 500
         hparams.cat_var_index = []
+    elif hparams.dataset_name in ['bindingdb', 'bindingdbtest']:
+        hparams.n_properties = 1
+        hparams.cat_var_index = [0]
+        assert hparams.max_len >= 150
     else:
         raise NotImplementedError()
     hparams.cont_var_index = [i for i in range(hparams.n_properties) if i not in hparams.cat_var_index]
@@ -903,10 +1155,10 @@ if __name__ == "__main__":
         model.load_state_dict(torch.load(hparams.load_checkpoint_path)["state_dict"])
     if hparams.compile:
         model = torch.compile(model)
-
+            
     neptune_logger = NeptuneLogger(
-        api_key="eyJhcGlfYWRkcmVzcyI6Imh0dHBzOi8vYXBwLm5lcHR1bmUuYWkiLCJhcGlfdXJsIjoiaHR0cHM6Ly9hcHAubmVwdHVuZS5haSIsImFwaV9rZXkiOiIyMWU0ZmVlZS00MzUyLTQwZjgtYWU5YS04MzE1NDE2MzhiNDAifQ==",
-        project="samsung/AutoregressiveMolecules",
+        api_key=os.getenv("NEPTUNE_API_TOKEN"),
+        project="zanzoonh/STGG",
         source_files="**/*.py",
         tags=hparams.tag.split("_"),
         log_model_checkpoints=False,
